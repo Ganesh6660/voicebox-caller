@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+twilio
+openai
+requests
+pydub
+websockets
+
+# Python 3.13 removed the stdlib `audioop` module used for mu-law encoding.
+audioop-lts
