@@ -2,15 +2,17 @@
 Real-time AI phone-call server.
 
 Handles two things:
-  1. GET /twiml       -> Twilio calls this once the outbound call connects.
-                          Responds with TwiML that opens a bidirectional
-                          Media Stream back to this server's WebSocket.
-  2. WS  /media-stream -> Twilio streams the caller's audio here in real time,
-                          and expects audio frames streamed back the same way.
+  1. POST /answer       -> Plivo calls this once the outbound call connects
+                            (or an inbound call arrives). Responds with
+                            PlivoXML that opens a bidirectional audio Stream
+                            back to this server's WebSocket.
+  2. WS   /media-stream  -> Plivo streams the caller's audio here in real
+                            time, and expects audio frames streamed back the
+                            same way.
 
 Loop per turn: buffer caller audio until a pause is detected -> transcribe
 (Whisper via Voicebox) -> ask the LLM for a reply, using your --context as
-the system prompt -> synthesize the reply -> resample/encode to Twilio's
+the system prompt -> synthesize the reply -> resample/encode to Plivo's
 format -> stream it back into the call.
 
 Speech synthesis is language-routed: English ("en") goes to Voicebox, using
@@ -25,9 +27,9 @@ AI + human hybrid: the LLM has a transfer_to_human tool. Its job is narrow —
 verify who's calling and what they want, not handle everything — so once
 it's satisfied the call is genuine it calls the tool instead of continuing
 to talk, and the server hands off to notify_human()/transfer_call_to_human()
-(both stubs below — fill in your telephony provider's actual transfer/SMS
-API once you've picked one). This keeps both LLM token spend and AI-side
-call minutes small per call, which is the point if cost is the priority.
+(both stubs below — fill in Plivo's actual transfer/SMS API calls, see the
+comments on each). This keeps both LLM token spend and AI-side call minutes
+small per call, which is the point if cost is the priority.
 
 Cost note: the model defaults to Haiku (ANTHROPIC_MODEL env var) rather than
 Sonnet. Haiku is roughly half Sonnet's per-token price and is plenty capable
@@ -41,6 +43,23 @@ confirmed against its source. Voicebox's FastAPI backend auto-serves Swagger
 docs — check http://127.0.0.1:17493/docs before your first real run and
 adjust `transcribe_audio()` / `synthesize_speech()` to match the actual
 field names if they differ.
+
+Plivo protocol notes (different from Twilio in a few real ways, not just
+naming — see README.md's pipeline section):
+  - The <Stream> element's WebSocket URL is its inner text content, not a
+    `url` attribute: <Stream ...>wss://host/media-stream</Stream>.
+  - `extraHeaders` on <Stream> is capped at 512 bytes and alphanumeric-only,
+    so it can't carry a free-text --context string. Context/language/the
+    call's CallUUID are passed as query params on the WebSocket URL instead.
+  - Incoming events over the WebSocket are still JSON, same shape family as
+    Twilio (`start`/`media`/`stop`), but the start event's stream id field
+    is `streamId`, not `streamSid`.
+  - Outgoing audio (server -> Plivo) is JSON too, NOT raw binary frames —
+    but a different envelope than Twilio's: {"event": "playAudio", "media":
+    {"contentType", "sampleRate", "payload"}}, no streamSid needed.
+  - The call's CallUUID is most reliably captured from the POST body Plivo
+    sends to answer_url, not parsed out of the WebSocket start event — this
+    server does that and threads it through as a query param.
 """
 
 import asyncio
@@ -49,6 +68,8 @@ import base64
 import io
 import json
 import os
+import urllib.parse
+import xml.sax.saxutils
 
 import requests
 import uvicorn
@@ -77,38 +98,55 @@ HUMAN_PHONE_NUMBER = os.environ.get("HUMAN_PHONE_NUMBER", "")
 anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
 app = FastAPI()
 
-# Twilio Media Streams use 8kHz, 8-bit mu-law, mono, sent as ~20ms (160-byte) frames.
+# Plivo audio streaming, like Twilio, uses 8kHz 8-bit mu-law mono, sent as
+# ~20ms (160-byte) frames — set via contentType="audio/x-mulaw;rate=8000" on
+# <Stream> below, which keeps all the existing audioop encode/decode as-is.
 SAMPLE_RATE = 8000
 FRAME_BYTES = 160
 SILENCE_RMS_THRESHOLD = 400   # tune against your mic/line noise
 SILENCE_MS_TO_END_TURN = 700  # pause length that means "they're done talking"
 
 
-@app.get("/twiml")
-async def twiml(request: Request):
+@app.post("/answer")
+async def answer(request: Request):
+    """Plivo's answer_url webhook. context/language arrive as query params on
+    this URL itself (set by place_call.py); CallUUID arrives in the POST body
+    Plivo sends here — capture it now rather than relying on the WebSocket
+    start event, and thread all three through as query params on the Stream
+    URL since extraHeaders can't carry free-text context."""
     context = request.query_params.get("context", "")
     language = request.query_params.get("language", "en")
+
+    form = await request.form()
+    call_uuid = form.get("CallUUID", "")
+
     ws_url = PUBLIC_BASE_URL.replace("https://", "wss://").replace("http://", "ws://")
-    twiml_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+    stream_url = (
+        f"{ws_url}/media-stream"
+        f"?context={urllib.parse.quote(context)}"
+        f"&language={urllib.parse.quote(language)}"
+        f"&call_uuid={urllib.parse.quote(call_uuid)}"
+    )
+
+    # stream_url's query string has literal "&" separators — those are XML
+    # metacharacters, so the URL must be XML-escaped before going into the
+    # <Stream> element's text content, or Plivo will fail to parse the XML.
+    stream_url_xml_safe = xml.sax.saxutils.escape(stream_url)
+
+    plivo_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Connect>
-    <Stream url="{ws_url}/media-stream">
-      <Parameter name="context" value="{context}" />
-      <Parameter name="language" value="{language}" />
-    </Stream>
-  </Connect>
+  <Stream bidirectional="true" keepCallAlive="true" contentType="audio/x-mulaw;rate=8000">{stream_url_xml_safe}</Stream>
 </Response>"""
-    return Response(content=twiml_xml, media_type="text/xml")
+    return Response(content=plivo_xml, media_type="text/xml")
 
 
 @app.websocket("/media-stream")
 async def media_stream(websocket: WebSocket):
     await websocket.accept()
 
-    stream_sid = None
-    call_sid = None
-    context = ""
-    language = "en"
+    call_sid = websocket.query_params.get("call_uuid", "")
+    context = websocket.query_params.get("context", "")
+    language = websocket.query_params.get("language", "en")
     conversation = []  # [{"role": "user"/"assistant", "content": "..."}]
 
     audio_buffer = bytearray()
@@ -122,19 +160,16 @@ async def media_stream(websocket: WebSocket):
             event = msg.get("event")
 
             if event == "start":
-                stream_sid = msg["start"]["streamSid"]
-                # Twilio/Plivo both include the underlying call's ID here — you'll need it
-                # to actually drive a transfer via your provider's REST API.
-                call_sid = msg["start"].get("callSid") or msg["start"].get("call_uuid")
-                params = msg["start"].get("customParameters", {})
-                context = params.get("context", "")
-                language = params.get("language", "en")
+                # Fallback only — call_sid normally already came from the
+                # answer webhook's CallUUID via the query params above.
+                if not call_sid:
+                    call_sid = msg["start"].get("callId") or msg["start"].get("call_uuid", "")
                 # Optional: speak an opening line right away instead of waiting for them to talk first.
                 opener, transfer = generate_reply(context, conversation, language, opener=True)
                 conversation.append({"role": "assistant", "content": opener})
-                await speak(websocket, stream_sid, opener, language)
+                await speak(websocket, opener, language)
                 if transfer:
-                    await handoff_to_human(websocket, stream_sid, call_sid, language, transfer)
+                    await handoff_to_human(websocket, call_sid, language, transfer)
                     break
 
             elif event == "media":
@@ -164,9 +199,9 @@ async def media_stream(websocket: WebSocket):
                             conversation.append({"role": "user", "content": transcript})
                             reply, transfer = generate_reply(context, conversation, language)
                             conversation.append({"role": "assistant", "content": reply})
-                            await speak(websocket, stream_sid, reply, language)
+                            await speak(websocket, reply, language)
                             if transfer:
-                                await handoff_to_human(websocket, stream_sid, call_sid, language, transfer)
+                                await handoff_to_human(websocket, call_sid, language, transfer)
                                 break
 
             elif event == "stop":
@@ -263,34 +298,34 @@ def generate_reply(context: str, conversation: list, language: str = "en", opene
     return text, transfer
 
 
-async def handoff_to_human(websocket: WebSocket, stream_sid: str, call_sid: str, language: str, transfer: dict):
+async def handoff_to_human(websocket: WebSocket, call_sid: str, language: str, transfer: dict):
     """Caller's been verified — get a human the context, then move the actual call over to
-    them. notify_human() and transfer_call_to_human() are stubs: fill in your telephony
-    provider's real SMS/transfer APIs once you've picked one (see README.md)."""
+    them. notify_human() and transfer_call_to_human() are stubs: fill in Plivo's real SMS/
+    transfer API calls (see the comments on each)."""
     notify_human(transfer["reason"], transfer["summary"])
     await transfer_call_to_human(call_sid)
 
 
 def notify_human(reason: str, summary: str):
     """STUB — send yourself (or the on-call agent) the handoff context. Cheapest version:
-    one SMS via your telephony provider's messaging API. Fill in once you've picked Plivo/
-    Exotel/etc. — this is intentionally not wired to anything yet."""
+    one SMS via Plivo's Messages API. Intentionally not wired to anything yet — needs your
+    Plivo auth_id/auth_token and a Plivo-verified sender number."""
     if not HUMAN_PHONE_NUMBER:
         print(f"[notify_human] (no HUMAN_PHONE_NUMBER set) {reason}: {summary}")
         return
-    # TODO: e.g. Plivo — plivo_client.messages.create(src=..., dst=HUMAN_PHONE_NUMBER,
-    #       text=f"{reason}: {summary}")
+    # TODO: import plivo; plivo.RestClient(auth_id, auth_token).messages.create(
+    #       src=PLIVO_FROM_NUMBER, dst=HUMAN_PHONE_NUMBER, text=f"{reason}: {summary}")
     print(f"[notify_human] would SMS {HUMAN_PHONE_NUMBER} -> {reason}: {summary}")
 
 
 async def transfer_call_to_human(call_sid: str):
-    """STUB — actually move the live call to HUMAN_PHONE_NUMBER via your provider's REST
-    API (a warm/cold transfer or a "Connect"-style redirect), using call_sid to identify
-    which call. Twilio: client.calls(call_sid).update(twiml=...) with a <Dial> to the
-    human's number. Plivo: a transfer/redirect call against the same call_uuid. This
-    scaffold just logs it — the WebSocket loop breaks right after, ending the AI's leg;
-    without a real transfer call here, the caller will just hear the line go quiet, so
-    don't treat this as done until you've wired in the real API call."""
+    """STUB — actually move the live call to HUMAN_PHONE_NUMBER via Plivo's REST API,
+    using call_sid (Plivo's CallUUID) to identify which call. Plivo's transfer endpoint is
+    POST /Call/{call_uuid}/ with an aleg_url pointing at PlivoXML that <Dial>s the human's
+    number (see https://www.plivo.com/docs/voice/api/call/transfer-a-call/). This scaffold
+    just logs it — the WebSocket loop breaks right after, ending the AI's leg; without a
+    real transfer call here, the caller will just hear the line go quiet, so don't treat
+    this as done until you've wired in the real API call."""
     print(f"[transfer_call_to_human] would transfer call_sid={call_sid} to {HUMAN_PHONE_NUMBER}")
 
 
@@ -313,8 +348,10 @@ def synthesize_speech(text: str, language: str = "en") -> bytes:
     return resp.content
 
 
-async def speak(websocket: WebSocket, stream_sid: str, text: str, language: str = "en"):
-    """Synthesize `text` and stream it into the live call as 20ms mu-law frames."""
+async def speak(websocket: WebSocket, text: str, language: str = "en"):
+    """Synthesize `text` and stream it into the live call as 20ms mu-law frames, using
+    Plivo's playAudio JSON envelope (event/media/contentType/sampleRate/payload — no
+    streamSid, unlike Twilio)."""
     wav_bytes = synthesize_speech(text, language)
     segment = AudioSegment.from_file(io.BytesIO(wav_bytes))
     segment = segment.set_frame_rate(SAMPLE_RATE).set_channels(1).set_sample_width(2)
@@ -328,13 +365,16 @@ async def speak(websocket: WebSocket, stream_sid: str, text: str, language: str 
         await websocket.send_text(
             json.dumps(
                 {
-                    "event": "media",
-                    "streamSid": stream_sid,
-                    "media": {"payload": base64.b64encode(frame).decode("ascii")},
+                    "event": "playAudio",
+                    "media": {
+                        "contentType": "audio/x-mulaw",
+                        "sampleRate": "8000",
+                        "payload": base64.b64encode(frame).decode("ascii"),
+                    },
                 }
             )
         )
-        # Pace roughly real-time so Twilio's jitter buffer doesn't choke on a burst.
+        # Pace roughly real-time so Plivo's jitter buffer doesn't choke on a burst.
         await asyncio.sleep(0.02)
 
 

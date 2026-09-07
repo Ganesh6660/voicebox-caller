@@ -1,11 +1,14 @@
 fastapi
 uvicorn[standard]
 python-dotenv
-twilio
+plivo
 anthropic
 requests
 pydub
 websockets
+# Needed for request.form() in the /answer webhook (Plivo POSTs CallUUID as
+# form-encoded data) — FastAPI/Starlette require this to parse form bodies.
+python-multipart
 
 # Hindi/Kannada support — needed by server.py/indic_tts.py at runtime
 # whenever --language hi/kn is used:

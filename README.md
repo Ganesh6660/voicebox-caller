@@ -13,16 +13,17 @@ are called out below.
 Voicebox (the `jamiepine/voicebox` app) generates speech and clones voices,
 but it has no telephony — it can't dial a number or carry audio over a phone
 network. This scaffold adds the missing piece: a telephony provider
-(Twilio) that places the call and streams the live audio to a small server
+(Plivo) that places the call and streams the live audio to a small server
 you run, which stitches together listening → thinking → speaking.
 
 ## The pipeline
 
 ```
-You type context  ──▶  place_call.py  ──▶  Twilio dials the number
+You type context  ──▶  place_call.py  ──▶  Plivo dials the number
                                                     │
-                                    Twilio opens a bidirectional
-                                    "Media Stream" WebSocket to server.py
+                                    Plivo POSTs to /answer, then opens a
+                                    bidirectional audio Stream WebSocket
+                                    to server.py (/media-stream)
                                                     │
         caller talks ──▶ audio chunks ──▶  server.py buffers audio
                                                     │
@@ -34,7 +35,8 @@ You type context  ──▶  place_call.py  ──▶  Twilio dials the number
                                                     │
                                   Voicebox /generate  (your cloned voice)
                                                     │
-                              convert to 8kHz mu-law, stream back
+                       convert to 8kHz mu-law, stream back as a
+                       Plivo "playAudio" JSON message
                                                     │
                                      caller hears it in the call
 ```
@@ -45,15 +47,17 @@ minute for one.
 
 ## What you need before this runs
 
-1. **A Twilio account** (twilio.com) with a phone number that has Voice
-   enabled. Trial accounts can call verified numbers only — fine for testing
-   on your own phone / friends who verify their number first.
+1. **A Plivo account** (plivo.com) with a phone number that has Voice
+   enabled, plus your `auth_id`/`auth_token` from the console. Plivo is
+   pay-as-you-go with no trial-account number-verification restriction like
+   Twilio's, but be considerate about who you're calling while testing —
+   see the limitations below.
 2. **Voicebox running locally** with its API reachable (default
    `http://127.0.0.1:17493`), with a cloned voice profile already created for
    the voice you want to speak with.
 3. **An Anthropic API key** (or swap in whatever LLM you prefer — see
    `generate_reply()` in `server.py`).
-4. **A public URL for `server.py`.** Twilio needs to reach your machine over
+4. **A public URL for `server.py`.** Plivo needs to reach your machine over
    the internet. Easiest for testing: `ngrok http 8000` and use the ngrok
    URL. For anything beyond testing, deploy `server.py` on a real host.
 5. **ffmpeg** installed (used for audio resampling/encoding).
@@ -105,12 +109,13 @@ back-and-forth around it based on what the other person actually says.
   seven engines you pick.** Lighter engines (Kokoro) will feel much more
   real-time than heavier voice-cloning ones. You may need to test a couple
   to find the latency/quality tradeoff that works.
-- **Audio format is a common trip-up.** Twilio Media Streams send/expect
-  8kHz, 8-bit mu-law audio. Voicebox will output something else (likely
-  16kHz+ PCM WAV) — `server.py` resamples and re-encodes this, but if you
-  swap components, this conversion is the first place to check when audio
-  sounds garbled or is silent.
-- **Caller ID:** the call will show your Twilio number, not your personal
+- **Audio format is a common trip-up.** Plivo's audio streaming (configured
+  via `contentType="audio/x-mulaw;rate=8000"` on `<Stream>` in `server.py`)
+  sends/expects 8kHz, 8-bit mu-law audio, same as Twilio. Voicebox will
+  output something else (likely 16kHz+ PCM WAV) — `server.py` resamples and
+  re-encodes this, but if you swap components, this conversion is the first
+  place to check when audio sounds garbled or is silent.
+- **Caller ID:** the call will show your Plivo number, not your personal
   SIM number. Making an automated call display an arbitrary number you
   don't control is caller-ID spoofing and is illegal in most places — don't
   try to work around this.
@@ -179,9 +184,9 @@ export step, not something that runs per-call.
 
 ## Files
 
-- `server.py` — the FastAPI app: TwiML endpoint + Media Stream WebSocket
-  handler + the STT → LLM → TTS loop, language-routed between Voicebox
-  (English) and the quantized Hindi/Kannada models.
+- `server.py` — the FastAPI app: PlivoXML answer endpoint + audio Stream
+  WebSocket handler + the STT → LLM → TTS loop, language-routed between
+  Voicebox (English) and the quantized Hindi/Kannada models.
 - `place_call.py` — CLI to kick off an outbound call with your context and
   `--language`.
 - `quantize_export.py` — one-time script: downloads, exports, and
