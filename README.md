@@ -126,10 +126,69 @@ back-and-forth around it based on what the other person actually says.
   for you — it's a personal testing setup, not a production telemarketing
   system.
 
+## Hindi and Kannada support
+
+Voicebox's cloning engines don't currently cover Hindi/Kannada well. The
+open-source option that does clone in these languages — AI4Bharat's
+IndicF5 — is built on F5-TTS's flow-matching architecture, which runs
+around 3x real-time even on a GPU; on CPU-only hardware (no GPU here) that
+delay is bad enough to break a live conversation. So for these two
+languages specifically, this project trades cloning away for speed:
+
+- **English (`--language en`, default):** Voicebox, your cloned voice.
+- **Hindi (`--language hi`) / Kannada (`--language kn`):** Meta's
+  MMS-TTS — a tiny (36M-parameter) VITS model per language, exported to
+  ONNX and quantized to int8 so it runs fast on CPU alone. This is a
+  **stock pretrained voice, not your cloned one** — that's the deliberate
+  tradeoff for staying real-time without a GPU.
+
+**One-time setup before your first Hindi/Kannada call:**
+
+```bash
+pip install torch transformers onnx onnxruntime
+python quantize_export.py
+```
+
+This downloads `facebook/mms-tts-hin` and `facebook/mms-tts-kan` from
+Hugging Face (a few hundred MB, one-time), exports each to ONNX, and
+quantizes to int8 into `models/hi/` and `models/kn/`. After that, `torch`
+and `onnx` are no longer needed — `server.py` only ever touches the small
+quantized files via `onnxruntime`.
+
+**License note:** `facebook/mms-tts-hin` and `facebook/mms-tts-kan` are
+CC-BY-NC 4.0 — **non-commercial use only**. Fine for personal testing on
+friends, but if this project ever turns into something you charge for or
+run for customers, swap this piece out for
+[AI4Bharat/Indic-TTS](https://github.com/AI4Bharat/Indic-TTS) instead —
+same idea (fixed voice, not cloned, but fast), MIT licensed so commercial
+use is fine, just a bit more setup work since it doesn't ship a ready HF
+`transformers` integration the way MMS-TTS does.
+
+**Usage:**
+
+```bash
+python place_call.py --to "+9198XXXXXXX" --context "..." --language hi
+python place_call.py --to "+9198XXXXXXX" --context "..." --language kn
+```
+
+**Why quantized specifically:** the model is already small (36M params —
+tiny by ML standards), but ONNX + int8 quantization is what pushes it from
+"probably fine" to "reliably fast" on a plain laptop CPU, the same trick
+lightweight CPU-first engines like Piper use by default. It's a one-time
+export step, not something that runs per-call.
+
 ## Files
 
 - `server.py` — the FastAPI app: TwiML endpoint + Media Stream WebSocket
-  handler + the STT → LLM → TTS loop.
-- `place_call.py` — CLI to kick off an outbound call with your context.
+  handler + the STT → LLM → TTS loop, language-routed between Voicebox
+  (English) and the quantized Hindi/Kannada models.
+- `place_call.py` — CLI to kick off an outbound call with your context and
+  `--language`.
+- `quantize_export.py` — one-time script: downloads, exports, and
+  quantizes the Hindi/Kannada models (see above).
+- `indic_tts.py` — runtime inference for the quantized Hindi/Kannada
+  models, called from `server.py`.
 - `requirements.txt` — Python dependencies.
 - `.env.example` — copy to `.env` and fill in.
+- `models/` — created by `quantize_export.py`; not committed to git (see
+  `.gitignore`) since it's fully regenerable from that script.

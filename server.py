@@ -10,8 +10,16 @@ Handles two things:
 
 Loop per turn: buffer caller audio until a pause is detected -> transcribe
 (Whisper via Voicebox) -> ask the LLM for a reply, using your --context as
-the system prompt -> synthesize the reply (Voicebox, your cloned voice) ->
-resample/encode to Twilio's format -> stream it back into the call.
+the system prompt -> synthesize the reply -> resample/encode to Twilio's
+format -> stream it back into the call.
+
+Speech synthesis is language-routed: English ("en") goes to Voicebox, using
+your cloned voice. Hindi ("hi") and Kannada ("kn") go to the local quantized
+MMS-TTS models in indic_tts.py instead — see README.md for why (Voicebox's
+cloning engines don't currently cover these two well, and the alternative
+that does, IndicF5, is too slow on CPU for a live call). Those two use a
+stock pretrained voice, not your cloned one. Run quantize_export.py once
+before placing a Hindi/Kannada call.
 
 IMPORTANT: the exact request/response shape of Voicebox's /transcribe and
 /generate endpoints below is my best inference from its public README, not
@@ -30,26 +38,22 @@ import os
 
 import requests
 import uvicorn
+from anthropic import Anthropic
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
-from openai import OpenAI
 from pydub import AudioSegment
+
+from indic_tts import synthesize_indic_wav_bytes
 
 load_dotenv()
 
 VOICEBOX_BASE_URL = os.environ.get("VOICEBOX_BASE_URL", "http://127.0.0.1:17493")
 VOICEBOX_VOICE_ID = os.environ["VOICEBOX_VOICE_ID"]  # the cloned voice profile to speak with
-# Preset-voice profiles are locked to the engine they were created with (e.g. "kokoro");
-# cloned-voice profiles are more flexible and can usually leave this as the Voicebox default.
-VOICEBOX_ENGINE = os.environ.get("VOICEBOX_ENGINE") or None
-# OpenRouter (openrouter.ai) proxies many models behind one OpenAI-compatible API.
-# ":free"-suffixed models cost nothing but are rate-limited.
-OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
-OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "minimax/minimax-m2.7:free")
+ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 PUBLIC_BASE_URL = os.environ["PUBLIC_BASE_URL"].rstrip("/")
 
-llm_client = OpenAI(api_key=OPENROUTER_API_KEY, base_url="https://openrouter.ai/api/v1")
+anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
 app = FastAPI()
 
 # Twilio Media Streams use 8kHz, 8-bit mu-law, mono, sent as ~20ms (160-byte) frames.
@@ -59,15 +63,17 @@ SILENCE_RMS_THRESHOLD = 400   # tune against your mic/line noise
 SILENCE_MS_TO_END_TURN = 700  # pause length that means "they're done talking"
 
 
-@app.api_route("/twiml", methods=["GET", "POST"])
+@app.get("/twiml")
 async def twiml(request: Request):
     context = request.query_params.get("context", "")
+    language = request.query_params.get("language", "en")
     ws_url = PUBLIC_BASE_URL.replace("https://", "wss://").replace("http://", "ws://")
     twiml_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
     <Stream url="{ws_url}/media-stream">
       <Parameter name="context" value="{context}" />
+      <Parameter name="language" value="{language}" />
     </Stream>
   </Connect>
 </Response>"""
@@ -80,6 +86,7 @@ async def media_stream(websocket: WebSocket):
 
     stream_sid = None
     context = ""
+    language = "en"
     conversation = []  # [{"role": "user"/"assistant", "content": "..."}]
 
     audio_buffer = bytearray()
@@ -94,11 +101,13 @@ async def media_stream(websocket: WebSocket):
 
             if event == "start":
                 stream_sid = msg["start"]["streamSid"]
-                context = msg["start"].get("customParameters", {}).get("context", "")
+                params = msg["start"].get("customParameters", {})
+                context = params.get("context", "")
+                language = params.get("language", "en")
                 # Optional: speak an opening line right away instead of waiting for them to talk first.
-                opener = generate_reply(context, conversation, opener=True)
+                opener = generate_reply(context, conversation, language, opener=True)
                 conversation.append({"role": "assistant", "content": opener})
-                await speak(websocket, stream_sid, opener)
+                await speak(websocket, stream_sid, opener, language)
 
             elif event == "media":
                 mulaw_chunk = base64.b64decode(msg["media"]["payload"])
@@ -125,9 +134,9 @@ async def media_stream(websocket: WebSocket):
 
                         if transcript.strip():
                             conversation.append({"role": "user", "content": transcript})
-                            reply = generate_reply(context, conversation)
+                            reply = generate_reply(context, conversation, language)
                             conversation.append({"role": "assistant", "content": reply})
-                            await speak(websocket, stream_sid, reply)
+                            await speak(websocket, stream_sid, reply, language)
 
             elif event == "stop":
                 break
@@ -153,71 +162,57 @@ def transcribe_audio(mulaw_bytes: bytes) -> str:
     return resp.json().get("text", "")
 
 
-def generate_reply(context: str, conversation: list, opener: bool = False) -> str:
+LANGUAGE_NAMES = {"en": "English", "hi": "Hindi", "kn": "Kannada"}
+
+
+def generate_reply(context: str, conversation: list, language: str = "en", opener: bool = False) -> str:
     """Ask the LLM what to say next, given your original context and the conversation so far."""
+    language_name = LANGUAGE_NAMES.get(language, "English")
     system_prompt = (
         "You are making a phone call on behalf of the user described below. "
+        f"Speak only in {language_name} — the whole reply, not just a greeting. "
         "Stay on topic, keep replies short and natural (like real speech, not an essay), "
         "and pursue the goal the user gave you. If the goal is accomplished or the other "
-        "person wants to end the call, wrap up politely. "
-        "Reply with ONLY the words to speak aloud — no stage directions, no asterisked "
-        "actions, no narration, no quotation marks around the line.\n\n"
+        "person wants to end the call, wrap up politely.\n\n"
         f"Call goal / context from the user: {context}"
     )
 
     if opener:
-        turns = [{"role": "user", "content": "Start the call now with a brief, natural opening line."}]
+        messages = [{"role": "user", "content": "Start the call now with a brief, natural opening line."}]
     else:
-        turns = conversation
+        messages = conversation
 
-    response = llm_client.chat.completions.create(
-        model=OPENROUTER_MODEL,
+    response = anthropic_client.messages.create(
+        model="claude-sonnet-4-5",
         max_tokens=200,
-        messages=[{"role": "system", "content": system_prompt}, *turns],
+        system=system_prompt,
+        messages=messages,
     )
-    return response.choices[0].message.content or ""
+    return "".join(block.text for block in response.content if block.type == "text")
 
 
-def synthesize_speech(text: str) -> bytes:
-    """Render `text` in the configured Voicebox profile and return WAV bytes.
+def synthesize_speech(text: str, language: str = "en") -> bytes:
+    """Render `text` as WAV bytes. English uses Voicebox (your cloned voice, via its
+    /generate endpoint); Hindi/Kannada use the local quantized MMS-TTS models instead
+    (a stock voice, not cloned — see README.md for why, and run quantize_export.py
+    once before using these two)."""
+    if language in ("hi", "kn"):
+        return synthesize_indic_wav_bytes(text, language)
 
-    Voicebox's /generate is async: it hands back a generation id immediately,
-    and /generate/{id}/status is a server-sent-events stream that keeps the
-    connection open, pushing status updates until the generation finishes.
-    """
-    payload = {"profile_id": VOICEBOX_VOICE_ID, "text": text}
-    if VOICEBOX_ENGINE:
-        payload["engine"] = VOICEBOX_ENGINE
-    resp = requests.post(f"{VOICEBOX_BASE_URL}/generate", json=payload, timeout=30)
+    resp = requests.post(
+        f"{VOICEBOX_BASE_URL}/generate",
+        json={"text": text, "voice_id": VOICEBOX_VOICE_ID},
+        timeout=30,
+    )
     resp.raise_for_status()
-    generation_id = resp.json()["id"]
-
-    status = None
-    with requests.get(
-        f"{VOICEBOX_BASE_URL}/generate/{generation_id}/status", stream=True, timeout=60
-    ) as status_resp:
-        status_resp.raise_for_status()
-        for line in status_resp.iter_lines(decode_unicode=True):
-            if not line or not line.startswith("data: "):
-                continue
-            event = json.loads(line[len("data: "):])
-            status = event["status"]
-            if status in ("completed", "failed", "error"):
-                break
-
-    if status != "completed":
-        raise RuntimeError(f"Voicebox generation {generation_id} ended with status={status!r}")
-
-    audio_resp = requests.get(
-        f"{VOICEBOX_BASE_URL}/history/{generation_id}/export-audio", timeout=30
-    )
-    audio_resp.raise_for_status()
-    return audio_resp.content
+    # Adjust this if Voicebox returns JSON with a base64 field instead of raw audio bytes —
+    # check the actual response shape at http://127.0.0.1:17493/docs.
+    return resp.content
 
 
-async def speak(websocket: WebSocket, stream_sid: str, text: str):
+async def speak(websocket: WebSocket, stream_sid: str, text: str, language: str = "en"):
     """Synthesize `text` and stream it into the live call as 20ms mu-law frames."""
-    wav_bytes = synthesize_speech(text)
+    wav_bytes = synthesize_speech(text, language)
     segment = AudioSegment.from_file(io.BytesIO(wav_bytes))
     segment = segment.set_frame_rate(SAMPLE_RATE).set_channels(1).set_sample_width(2)
     linear_pcm = segment.raw_data

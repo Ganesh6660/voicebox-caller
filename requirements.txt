@@ -2,10 +2,23 @@ fastapi
 uvicorn[standard]
 python-dotenv
 twilio
-openai
+anthropic
 requests
 pydub
 websockets
 
+# Hindi/Kannada support — needed by server.py/indic_tts.py at runtime
+# whenever --language hi/kn is used:
+onnxruntime
+transformers
+numpy
+
+# Only needed once, to run quantize_export.py (NOT required by server.py
+# itself once models/ has already been generated — safe to skip these two
+# if you're only ever calling with --language en):
+# torch
+# onnx
+
 # Python 3.13 removed the stdlib `audioop` module used for mu-law encoding.
-audioop-lts
+# If you're on 3.13+, uncomment the line below:
+# audioop-lts
