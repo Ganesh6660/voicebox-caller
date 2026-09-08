@@ -75,7 +75,6 @@ import xml.sax.saxutils
 import plivo
 import requests
 import uvicorn
-from anthropic import Anthropic
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
@@ -86,13 +85,27 @@ from indic_tts import synthesize_indic_wav_bytes
 load_dotenv()
 
 VOICEBOX_BASE_URL = os.environ.get("VOICEBOX_BASE_URL", "http://127.0.0.1:17493")
-VOICEBOX_VOICE_ID = os.environ["VOICEBOX_VOICE_ID"]  # the cloned voice profile to speak with
-ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+VOICEBOX_VOICE_ID = os.environ["VOICEBOX_VOICE_ID"]  # a Voicebox profile_id (cloned or preset)
+VOICEBOX_ENGINE = os.environ.get("VOICEBOX_ENGINE", "kokoro")  # must match VOICEBOX_VOICE_ID's engine
 PUBLIC_BASE_URL = os.environ["PUBLIC_BASE_URL"].rstrip("/")
 
-# Haiku by default for cost — this role is triage (verify + decide), not deep
-# reasoning. Override in .env with a Sonnet model ID for calls that need more.
-ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
+# LLM: OpenRouter if OPENROUTER_API_KEY is set, else Anthropic direct. Lets you
+# switch providers purely via .env — no code changes needed either way. Both
+# get a "triage" role (verify + decide, not deep reasoning), so a cheap/fast
+# model is the right default; override via OPENROUTER_MODEL/ANTHROPIC_MODEL in
+# .env for calls that need the AI to carry more of the conversation itself.
+if os.environ.get("OPENROUTER_API_KEY"):
+    from openai import OpenAI
+
+    LLM_PROVIDER = "openrouter"
+    LLM_MODEL = os.environ.get("OPENROUTER_MODEL", "anthropic/claude-haiku-4.5")
+    llm_client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=os.environ["OPENROUTER_API_KEY"])
+else:
+    from anthropic import Anthropic
+
+    LLM_PROVIDER = "anthropic"
+    LLM_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
+    llm_client = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
 # Where a verified/genuine caller gets handed off to. E.164 format.
 HUMAN_PHONE_NUMBER = os.environ.get("HUMAN_PHONE_NUMBER", "")
@@ -103,7 +116,6 @@ PLIVO_AUTH_ID = os.environ["PLIVO_AUTH_ID"]
 PLIVO_AUTH_TOKEN = os.environ["PLIVO_AUTH_TOKEN"]
 PLIVO_FROM_NUMBER = os.environ["PLIVO_FROM_NUMBER"]
 
-anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
 plivo_client = plivo.RestClient(PLIVO_AUTH_ID, PLIVO_AUTH_TOKEN)
 app = FastAPI()
 
@@ -287,6 +299,17 @@ TRANSFER_TOOL = {
     },
 }
 
+# Same tool, OpenAI/OpenRouter's function-calling shape (input_schema -> parameters,
+# wrapped in {"type": "function", "function": {...}}) — used only in the openrouter branch.
+TRANSFER_TOOL_OPENAI = {
+    "type": "function",
+    "function": {
+        "name": TRANSFER_TOOL["name"],
+        "description": TRANSFER_TOOL["description"],
+        "parameters": TRANSFER_TOOL["input_schema"],
+    },
+}
+
 
 def generate_reply(context: str, conversation: list, language: str = "en", opener: bool = False):
     """Ask the LLM what to say next. Returns (reply_text, transfer_or_None) — transfer is a
@@ -310,8 +333,26 @@ def generate_reply(context: str, conversation: list, language: str = "en", opene
     else:
         messages = conversation
 
-    response = anthropic_client.messages.create(
-        model=ANTHROPIC_MODEL,
+    if LLM_PROVIDER == "openrouter":
+        response = llm_client.chat.completions.create(
+            model=LLM_MODEL,
+            max_tokens=200,
+            messages=[{"role": "system", "content": system_prompt}] + messages,
+            tools=[TRANSFER_TOOL_OPENAI],
+            extra_headers={"HTTP-Referer": PUBLIC_BASE_URL, "X-Title": "Voicebox Caller"},
+        )
+        choice = response.choices[0].message
+        text = choice.content or ""
+        transfer = None
+        for tool_call in choice.tool_calls or []:
+            if tool_call.function.name == "transfer_to_human":
+                args = json.loads(tool_call.function.arguments)
+                transfer = {"reason": args.get("reason", ""), "summary": args.get("summary", "")}
+                break
+        return text, transfer
+
+    response = llm_client.messages.create(
+        model=LLM_MODEL,
         max_tokens=200,
         system=system_prompt,
         tools=[TRANSFER_TOOL],
@@ -377,21 +418,25 @@ async def transfer_call_to_human(call_sid: str):
 
 
 def synthesize_speech(text: str, language: str = "en") -> bytes:
-    """Render `text` as WAV bytes. English uses Voicebox (your cloned voice, via its
-    /generate endpoint); Hindi/Kannada use the local quantized MMS-TTS models instead
-    (a stock voice, not cloned — see README.md for why, and run quantize_export.py
-    once before using these two)."""
+    """Render `text` as WAV bytes. English uses Voicebox (your voice profile, via its
+    /generate/stream endpoint); Hindi/Kannada use the local quantized MMS-TTS models
+    instead (a stock voice, not cloned — see README.md for why, and run
+    quantize_export.py once before using these two).
+
+    Uses /generate/stream (not /generate) because /generate is async — it returns a
+    job id you'd have to poll and then fetch from /audio/{generation_id}, which adds
+    a round trip a live call can't afford. /generate/stream returns the WAV bytes
+    directly. `engine` must be passed explicitly: the API defaults to "qwen" (GPU-
+    oriented) whenever it's omitted, regardless of the profile's own default engine."""
     if language in ("hi", "kn"):
         return synthesize_indic_wav_bytes(text, language)
 
     resp = requests.post(
-        f"{VOICEBOX_BASE_URL}/generate",
-        json={"text": text, "voice_id": VOICEBOX_VOICE_ID},
+        f"{VOICEBOX_BASE_URL}/generate/stream",
+        json={"text": text, "profile_id": VOICEBOX_VOICE_ID, "engine": VOICEBOX_ENGINE, "language": language},
         timeout=30,
     )
     resp.raise_for_status()
-    # Adjust this if Voicebox returns JSON with a base64 field instead of raw audio bytes —
-    # check the actual response shape at http://127.0.0.1:17493/docs.
     return resp.content
 
 

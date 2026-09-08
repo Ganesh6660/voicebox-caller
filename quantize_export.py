@@ -33,6 +33,16 @@ MODELS = {
     "kn": "facebook/mms-tts-kan",
 }
 
+# Each MMS-TTS tokenizer's vocab is script-specific (Devanagari for Hindi, Kannada
+# script for Kannada) — an English dummy sentence tokenizes to an empty tensor
+# (no Latin characters are in the vocab), which breaks ONNX tracing with a
+# confusing "Expected tensor ... Long, Int; but got FloatTensor" error deep in
+# the embedding layer. Use real text in each language's own script instead.
+DUMMY_TEXT = {
+    "hi": "नमस्ते, आप कैसे हैं?",
+    "kn": "ನಮಸ್ಕಾರ, ನೀವು ಹೇಗಿದ್ದೀರಿ?",
+}
+
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "models")
 
 
@@ -62,8 +72,7 @@ def export_and_quantize(lang_code: str, hf_model_id: str):
         json.dump({"sampling_rate": model.config.sampling_rate}, f)
 
     wrapper = VitsONNXWrapper(model)
-    dummy_text = "this is a sample sentence used only to trace the model shapes"
-    dummy_inputs = tokenizer(dummy_text, return_tensors="pt")
+    dummy_inputs = tokenizer(DUMMY_TEXT[lang_code], return_tensors="pt")
 
     fp32_path = os.path.join(out_dir, "model.onnx")
     int8_path = os.path.join(out_dir, "model.int8.onnx")

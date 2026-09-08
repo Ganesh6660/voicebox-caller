@@ -3,6 +3,7 @@ uvicorn[standard]
 python-dotenv
 plivo
 anthropic
+openai
 requests
 pydub
 websockets
