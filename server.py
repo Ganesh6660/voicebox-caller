@@ -26,9 +26,10 @@ before placing a Hindi/Kannada call.
 AI + human hybrid: the LLM has a transfer_to_human tool. Its job is narrow —
 verify who's calling and what they want, not handle everything — so once
 it's satisfied the call is genuine it calls the tool instead of continuing
-to talk, and the server hands off to notify_human()/transfer_call_to_human()
-(both stubs below — fill in Plivo's actual transfer/SMS API calls, see the
-comments on each). This keeps both LLM token spend and AI-side call minutes
+to talk, and the server hands off to notify_human()/transfer_call_to_human(),
+which text you the context (Plivo Messages API) and move the live call over
+to HUMAN_PHONE_NUMBER (Plivo's call-transfer API, via the /transfer-xml
+endpoint below). This keeps both LLM token spend and AI-side call minutes
 small per call, which is the point if cost is the priority.
 
 Cost note: the model defaults to Haiku (ANTHROPIC_MODEL env var) rather than
@@ -71,6 +72,7 @@ import os
 import urllib.parse
 import xml.sax.saxutils
 
+import plivo
 import requests
 import uvicorn
 from anthropic import Anthropic
@@ -95,7 +97,14 @@ ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
 # Where a verified/genuine caller gets handed off to. E.164 format.
 HUMAN_PHONE_NUMBER = os.environ.get("HUMAN_PHONE_NUMBER", "")
 
+# Same Plivo credentials place_call.py uses — server.py needs its own client
+# to actually place the handoff SMS and drive the live-call transfer.
+PLIVO_AUTH_ID = os.environ["PLIVO_AUTH_ID"]
+PLIVO_AUTH_TOKEN = os.environ["PLIVO_AUTH_TOKEN"]
+PLIVO_FROM_NUMBER = os.environ["PLIVO_FROM_NUMBER"]
+
 anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
+plivo_client = plivo.RestClient(PLIVO_AUTH_ID, PLIVO_AUTH_TOKEN)
 app = FastAPI()
 
 # Plivo audio streaming, like Twilio, uses 8kHz 8-bit mu-law mono, sent as
@@ -136,6 +145,27 @@ async def answer(request: Request):
     plivo_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Stream bidirectional="true" keepCallAlive="true" contentType="audio/x-mulaw;rate=8000">{stream_url_xml_safe}</Stream>
+</Response>"""
+    return Response(content=plivo_xml, media_type="text/xml")
+
+
+@app.post("/transfer-xml")
+async def transfer_xml():
+    """aleg_url target for transfer_call_to_human()'s Call-transfer API request below.
+    Plivo fetches this and swaps it in for the call's current instructions — since the
+    A-leg was running the <Stream> from /answer, returning a <Dial> here is what actually
+    ends the AI's WebSocket leg and connects the live caller straight to a human."""
+    if not HUMAN_PHONE_NUMBER:
+        # Nothing to dial — end the call cleanly rather than fail the transfer silently.
+        return Response(
+            content='<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>',
+            media_type="text/xml",
+        )
+    plivo_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Dial callerId="{xml.sax.saxutils.escape(PLIVO_FROM_NUMBER)}">
+    <Number>{xml.sax.saxutils.escape(HUMAN_PHONE_NUMBER)}</Number>
+  </Dial>
 </Response>"""
     return Response(content=plivo_xml, media_type="text/xml")
 
@@ -300,33 +330,50 @@ def generate_reply(context: str, conversation: list, language: str = "en", opene
 
 async def handoff_to_human(websocket: WebSocket, call_sid: str, language: str, transfer: dict):
     """Caller's been verified — get a human the context, then move the actual call over to
-    them. notify_human() and transfer_call_to_human() are stubs: fill in Plivo's real SMS/
-    transfer API calls (see the comments on each)."""
+    them via Plivo's Messages and Call-transfer APIs."""
     notify_human(transfer["reason"], transfer["summary"])
     await transfer_call_to_human(call_sid)
 
 
 def notify_human(reason: str, summary: str):
-    """STUB — send yourself (or the on-call agent) the handoff context. Cheapest version:
-    one SMS via Plivo's Messages API. Intentionally not wired to anything yet — needs your
-    Plivo auth_id/auth_token and a Plivo-verified sender number."""
+    """Text yourself (or the on-call agent) the handoff context via Plivo's Messages API —
+    the cheapest way to get a human the context before the call lands on them. Failure here
+    shouldn't block the actual call transfer, so it's caught and logged rather than raised."""
     if not HUMAN_PHONE_NUMBER:
         print(f"[notify_human] (no HUMAN_PHONE_NUMBER set) {reason}: {summary}")
         return
-    # TODO: import plivo; plivo.RestClient(auth_id, auth_token).messages.create(
-    #       src=PLIVO_FROM_NUMBER, dst=HUMAN_PHONE_NUMBER, text=f"{reason}: {summary}")
-    print(f"[notify_human] would SMS {HUMAN_PHONE_NUMBER} -> {reason}: {summary}")
+    try:
+        response = plivo_client.messages.create(
+            src=PLIVO_FROM_NUMBER,
+            dst=HUMAN_PHONE_NUMBER,
+            text=f"Incoming handoff — {reason}: {summary}",
+        )
+        print(f"[notify_human] SMS sent to {HUMAN_PHONE_NUMBER}, message_uuid={response.message_uuid}")
+    except Exception as exc:  # Plivo SDK raises plivo.exceptions.PlivoRestError, etc.
+        print(f"[notify_human] FAILED to SMS {HUMAN_PHONE_NUMBER} -> {reason}: {summary} ({exc})")
 
 
 async def transfer_call_to_human(call_sid: str):
-    """STUB — actually move the live call to HUMAN_PHONE_NUMBER via Plivo's REST API,
-    using call_sid (Plivo's CallUUID) to identify which call. Plivo's transfer endpoint is
-    POST /Call/{call_uuid}/ with an aleg_url pointing at PlivoXML that <Dial>s the human's
-    number (see https://www.plivo.com/docs/voice/api/call/transfer-a-call/). This scaffold
-    just logs it — the WebSocket loop breaks right after, ending the AI's leg; without a
-    real transfer call here, the caller will just hear the line go quiet, so don't treat
-    this as done until you've wired in the real API call."""
-    print(f"[transfer_call_to_human] would transfer call_sid={call_sid} to {HUMAN_PHONE_NUMBER}")
+    """Move the live call to HUMAN_PHONE_NUMBER via Plivo's call-transfer API: it re-points
+    the call's A-leg at /transfer-xml, which returns a <Dial> to the human — that's what
+    actually ends the AI's WebSocket leg and connects the caller, not the `break` in the
+    WebSocket loop (that just stops this server from listening/speaking on its side)."""
+    if not call_sid:
+        print("[transfer_call_to_human] no call_sid available — can't transfer, caller will just hear silence")
+        return
+    if not HUMAN_PHONE_NUMBER:
+        print(f"[transfer_call_to_human] no HUMAN_PHONE_NUMBER set — can't transfer call_sid={call_sid}")
+        return
+    try:
+        response = plivo_client.calls.transfer(
+            call_uuid=call_sid,
+            legs="aleg",
+            aleg_url=f"{PUBLIC_BASE_URL}/transfer-xml",
+            aleg_method="POST",
+        )
+        print(f"[transfer_call_to_human] transferred call_sid={call_sid} to {HUMAN_PHONE_NUMBER}: {response}")
+    except Exception as exc:  # Plivo SDK raises plivo.exceptions.PlivoRestError, etc.
+        print(f"[transfer_call_to_human] FAILED to transfer call_sid={call_sid} to {HUMAN_PHONE_NUMBER} ({exc})")
 
 
 def synthesize_speech(text: str, language: str = "en") -> bytes:
